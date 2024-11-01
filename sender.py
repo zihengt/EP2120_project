@@ -1,4 +1,4 @@
-# Sender (sender.py) with BBR Congestion Control, Error Handling, and Congestion Window Monitoring
+# Sender (sender.py) with Dynamic RTO Calculation
 import socket
 import struct
 import time
@@ -18,7 +18,7 @@ class ClientState(Enum):
 # 常量
 dest_ip = '172.20.0.3'
 dest_port = 12346
-RTO = 1.0  # 重传超时时间（秒）
+INITIAL_RTO = 1.0  # 初始重传超时时间（秒）
 WINDOW_SIZE = 5  # 发送窗口大小
 NUM_STREAMS = 3  # 并发的流数量
 
@@ -110,6 +110,13 @@ def main():
     send_quantum = 1200  # 每个数据包的大小（字节）
     last_send_time = 0  # 上次发送的时间
 
+    # RTO 相关参数
+    SRTT = None  # 平滑的 RTT
+    RTTVAR = None  # RTT 的方差
+    RTO = INITIAL_RTO  # 重传超时时间
+    alpha = 1/8
+    beta = 1/4
+
     # 初始化数据记录文件
     with open(sender_log_file, 'w', newline='') as csvfile:
         fieldnames = ['timestamp', 'stream_id', 'offset', 'max_stream_data']
@@ -118,7 +125,7 @@ def main():
 
     # 初始化指标记录文件
     with open(metrics_log_file, 'w', newline='') as csvfile:
-        fieldnames = ['timestamp', 'packet_number', 'rtt', 'btlbw', 'pacing_rate', 'bbr_state', 'pending_acks', 'cwnd']
+        fieldnames = ['timestamp', 'packet_number', 'rtt', 'srtt', 'rttvar', 'rto', 'btlbw', 'pacing_rate', 'bbr_state', 'pending_acks', 'cwnd']
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writeheader()
 
@@ -209,18 +216,25 @@ def main():
                         ack_number = struct.unpack('!I', ack_response[1:5])[0]
                         if ack_number in pending_acks:
                             send_time = pending_acks[ack_number][0]
-                            rtt = time.time() - send_time
-                            if rtt == 0:
-                                rtt = 0.000001  # 避免除以零
-                            # 模拟实际网络延迟，忽略过小的RTT
-                            if rtt < 0.01:
-                                rtt = 0.01
-                            # 初始化min_rtt和btlbw
-                            if min_rtt is None or rtt < min_rtt:
-                                min_rtt = rtt
-                            print(f'收到ACK，包编号: {ack_number}, RTT: {rtt:.6f}s')
+                            rtt_sample = time.time() - send_time
+                            if rtt_sample == 0:
+                                rtt_sample = 0.000001  # 避免除以零
+                            # 初始化 SRTT 和 RTTVAR
+                            if SRTT is None:
+                                SRTT = rtt_sample
+                                RTTVAR = rtt_sample / 2
+                            else:
+                                RTTVAR = (1 - beta) * RTTVAR + beta * abs(SRTT - rtt_sample)
+                                SRTT = (1 - alpha) * SRTT + alpha * rtt_sample
+                            RTO = SRTT + max(0.1, 4 * RTTVAR)  # 设置最小 RTO 为 100 毫秒
+                            # 模拟实际网络延迟，忽略过小的 RTT
+                            if rtt_sample < 0.01:
+                                rtt_sample = 0.01
+                            if min_rtt is None or rtt_sample < min_rtt:
+                                min_rtt = rtt_sample
+                            print(f'收到ACK，包编号: {ack_number}, RTT: {rtt_sample:.6f}s, SRTT: {SRTT:.6f}s, RTTVAR: {RTTVAR:.6f}s, RTO: {RTO:.6f}s')
                             # 更新带宽估计
-                            inst_bw = send_quantum / rtt
+                            inst_bw = send_quantum / rtt_sample
                             if btlbw is None or inst_bw > btlbw:
                                 btlbw = inst_bw
                             del pending_acks[ack_number]
@@ -243,11 +257,14 @@ def main():
 
                             # 记录指标
                             with open(metrics_log_file, 'a', newline='') as csvfile:
-                                writer = csv.DictWriter(csvfile, fieldnames=['timestamp', 'packet_number', 'rtt', 'btlbw', 'pacing_rate', 'bbr_state', 'pending_acks', 'cwnd'])
+                                writer = csv.DictWriter(csvfile, fieldnames=['timestamp', 'packet_number', 'rtt', 'srtt', 'rttvar', 'rto', 'btlbw', 'pacing_rate', 'bbr_state', 'pending_acks', 'cwnd'])
                                 writer.writerow({
                                     'timestamp': time.time(),
                                     'packet_number': ack_number,
-                                    'rtt': rtt,
+                                    'rtt': rtt_sample,
+                                    'srtt': SRTT,
+                                    'rttvar': RTTVAR,
+                                    'rto': RTO,
                                     'btlbw': btlbw,
                                     'pacing_rate': pacing_rate,
                                     'bbr_state': bbr_state,
@@ -255,12 +272,14 @@ def main():
                                     'cwnd': cwnd
                                 })
 
-                    elif ack_type == 0x11:  # MAX_STREAM_DATA帧
-                        stream_id, max_stream_data = struct.unpack('!HI', ack_response[1:7])
-                        if stream_id in streams:
-                            streams[stream_id]['max_stream_data'] = max_stream_data
-                            streams[stream_id]['blocked'] = False
-                            print(f'收到MAX_STREAM_DATA，流ID: {stream_id}, 新的窗口大小: {max_stream_data}')
+                        elif ack_type == 0x11:  # MAX_STREAM_DATA帧
+                            stream_id, max_stream_data = struct.unpack('!HI', ack_response[1:7])
+                            if stream_id in streams:
+                                streams[stream_id]['max_stream_data'] = max_stream_data
+                                streams[stream_id]['blocked'] = False
+                                print(f'收到MAX_STREAM_DATA，流ID: {stream_id}, 新的窗口大小: {max_stream_data}')
+                    else:
+                        print(f'收到未知类型的ACK帧，类型: {ack_type}')
                 except socket.timeout:
                     pass
                 except Exception as e:
@@ -271,7 +290,7 @@ def main():
                 current_time = time.time()
                 for pkt_num, (timestamp, packet) in list(pending_acks.items()):
                     if current_time - timestamp > RTO:
-                        print(f'包编号{pkt_num}超时，作为新包重传...')
+                        print(f'包编号{pkt_num}超时（RTO={RTO:.6f}s），作为新包重传...')
                         # 重传数据包，使用新的包编号
                         packet_type, _, dest_conn_id_packet, src_conn_id_packet, header_size = parse_quic_header(packet)
                         payload = packet[header_size:]
@@ -282,6 +301,8 @@ def main():
                         pending_acks[packet_number] = (current_time, new_packet)
                         packet_number += 1  # 递增包编号
                         del pending_acks[pkt_num]
+                        # 增加 RTO（指数回退）
+                        RTO = min(RTO * 2, 60.0)  # 最大 RTO 设为 60 秒
 
                 # 计算 pacing_interval
                 if btlbw is not None:
